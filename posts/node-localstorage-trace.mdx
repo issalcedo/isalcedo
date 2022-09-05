@@ -1,0 +1,204 @@
+---
+title: Using AsyncLocalStorage to Trace Requests in Node.JS
+description: One of the challenges writing Node.JS microservices is being able to using tracing to follow the path of a request within your application.
+date: '2021-03-20'
+image: '/images/bridge.jpg'
+---
+
+One of the challenges writing Node.JS microservices is being able to instrumentation like tracing to follow the path of a request within your service.
+Due to the asynchronous nature of a Node.JS application, the platform doesn't supply a way to store context for each request and have it accessible
+through the lifetime of the request. As a result, the developer is left to pass context objects down the request path. If the application follows
+a traditional model of controller/service/store then managing the context becomes challenging.
+
+The company I was working for in the past was building a micro-services platform for a video streaming application. Developers had the option develop microservices in two flavors: ``Java`` and `Node.JS`.
+At the time, Java had a major advantage over Node.JS due to the progress Netflix had made in developing JVM microservices and sharing their solutions
+to the world via open source. Our organization decided to support Node.JS because we believed it was more productive language and there was existing adoption. One of
+my responsibilities was developing infrastructure tools for the Node.JS platform and bringing it up to parity with the JVM platform (e.g, circuit breakers, logging, service discovery and more).
+When the concept of distributed tracing was introduced, I knew not having something like Java's `ThreadLocal` in Node.JS was going to make tasks like logging challenging.
+The first iteration of the tools required developers to pass context where it was needed. As expected, the developer experience was undesirable.
+
+## Improving the Experience
+
+I've been following the development of ```async_hooks``` back when it was first introduced in version `8`. The `async_hooks` library allows you to attach listeners throughout the lifetime
+of an asynchronous operation. There are libraries like [`cls-hooked`](https://www.npmjs.com/package/cls-hooked) which levered `async_hooks` to work like thead-local storage in a threaded programming language.
+Unfortunately, we were not able to utilize such libraries due to the overhead it added. However, Node.JS 13 and above has [improved performance](https://twitter.com/AndreyPechkurov/status/1234189388436967426?s=20).
+It will be interesting to see how `async_hooks` is used in production now that the overhead concerns are starting to ease.
+
+## How To Use `async_hooks`
+
+The `async_hooks` library allows you to develop stores which remain accessible through the lifetime of the async operation. Node.JS recommends using `AsyncLocalStorage` because of the optimizations
+built in. Lets explorer how to use `AsyncLocalStorage` to add trace info to logs.
+
+I'm going to be using KOA for our HTTP Request Framework, Winston for logging, and Zipkin tracing.
+
+Our application bootstrap and entrypoint:
+```ts:index.ts
+import Koa from 'koa'
+const {Tracer, ConsoleRecorder, ExplicitContext} = require('zipkin');
+const {koaMiddleware} = require('zipkin-instrumentation-koa');
+
+const ctxImpl = new ExplicitContext();
+const recorder = new ConsoleRecorder();
+const tracer = new Tracer({recorder, ctxImpl, localServiceName: 'zipkin-koa-demo'});
+
+import routes from './routes'
+
+const app = new Koa()
+
+app.use(koaMiddleware({tracer}));
+
+routes(app)
+```
+
+Our application routes:
+```ts:routes.ts
+import Koa { Context } from 'koa'
+import Router from 'koa-router'
+import doSomething from './doSomething'
+
+import logger from './logger'
+
+const router = new Router({
+  prefix: '/v1/resources'
+})
+
+router.get('/', async (ctx) => {
+  logger.info('log something helpful from request')
+  const response = doSomething()
+  ctx.body = response
+})
+
+export default function (app: Koa) {
+  app.use(router.routes())
+}
+```
+
+Where we define our business logic:
+```ts:doSomething.ts
+import logger from './logger'
+
+const helperFunction = () => {
+  throw Error('unexpected error')
+}
+
+const doSomething = () => {
+  try {
+    return helperFunction()
+  } catch(e) {
+    logger.error('something went wrong', e)
+    throw e
+  }
+}
+
+export default doSomething
+```
+
+Our logging library:
+```ts:logger.ts
+import { createLogger, format, transports } from 'winston'
+
+const logger = createLogger({
+  format: format.combine(
+    format.errors({ stack: true }),
+    format.splat(),
+    format.colorize(),
+    format.timestamp(),
+    format.printf(({ level, message, timestamp }) => {
+      const object = {level, timestamp, message}
+      return JSON.stringify(object) //simple json logger
+    })
+  ),
+  transports: [new transports.Console()]
+})
+
+export default logger
+```
+
+We have a basic application which defines a simple route and `doSomething` module where we would define our business logic.
+The `index.js` module adds `zipkin-instrumentation-koa` which is configured to output recordings to the console. There are two log messages: one at the entry point of the request and another in the catch block of our business logic layer.
+The tracing library outputs request and response information. For example:
+
+```shell
+(timestamp=1629611119033842, spanId=427d92312b0bc9dc, parentId=427d92312b0bc9dc, traceId=427d92312b0bc9dc): ServiceName("zipkin-koa-demo")
+(timestamp=1629611119046840, spanId=427d92312b0bc9dc, parentId=427d92312b0bc9dc, traceId=427d92312b0bc9dc): Rpc("GET")
+(timestamp=1629611119047944, spanId=427d92312b0bc9dc, parentId=427d92312b0bc9dc, traceId=427d92312b0bc9dc): BinaryAnnotation(http.path="/v1/resources")
+(timestamp=1629611120432434, spanId=427d92312b0bc9dc, parentId=427d92312b0bc9dc, traceId=427d92312b0bc9dc): BinaryAnnotation(http.status_code="200")
+```
+
+The trace information is useful for recording requests and responses. However, it doesn't tell the entire story of each request.
+The log messages that are recorded after the HTTP layer provide insight of the health of the application, but in a large distributed system
+with a high volume of requests, the log messages are difficult to correlate to the same request.
+
+## Adding `AsyncLocalStorage`
+
+Let's create middleware for Koa which will create an async local storage for incoming requests. The store will hold the trace information
+supplied by zipkin, so we can access the trace IDs later down the in the service.
+
+```ts:middleware.ts
+import { AsyncLocalStorage } from 'async_hooks'
+import { Context } from 'koa'
+
+export interface ITraceId {
+  spanId: string
+  traceId: string
+}
+
+export const asyncLocalStorage = new AsyncLocalStorage<ITraceId>()
+
+export const middleware = async (ctx: Context, next: () => Promise<void>) => {
+  const { _spanId: spanId, _traceId: traceId } = ctx.request._trace_id
+  await asyncLocalStorage.run({ spanId, traceId }, async () => {
+    return await next()
+  })
+}
+
+export default middleware
+```
+
+Our middleware imports `AsyncLocalStorage` and creates an instance. If you're using TypeScript like this example, you can
+define the interface for the store. There are few things our middleware is doing: First it destructs the trace and span ID
+from the property injected to the request object by the zipkin middleware. The next operation is executing the `run` function
+which takes two arguments: the store values and a callback. The local storage works by having the async process execute within
+the context of the callback. Within the context of the callback, the lifecycle of the process can be tracked. In this example,
+it is simply invoking `next()` to execute the next middleware. Our middleware is also exporting the instance of `AsyncLocalStorage`
+to be able to access our store from other modules. If you're invoking `await` inside the callback, make sure you `await` the `run()`
+operation.
+
+Now that we stored the trace information, we can access them in our logger.
+
+```ts:logger.ts
+import { createLogger, format, transports } from 'winston'
+import { asyncLocalStorage } from '../middleware'
+
+const logger = createLogger({
+  format: format.combine(
+    format.errors({ stack: true }),
+    format.splat(),
+    format.colorize(),
+    format.timestamp(),
+    format.printf(({ level, message, timestamp }) => {
+      const object = {level, timestamp, message}
+      const store = asyncLocalStorage.getStore()
+
+      if (store) {
+        object.traceId = store.traceId
+        object.spanId = store.spanId
+      }
+
+      return JSON.stringify(object) //simple json logger
+    })
+  ),
+  transports: [new transports.Console()]
+})
+
+export default logger
+```
+
+The logger imports the local storage. In `printf()`, we retrieve the store and add the trace properties to the object before it's stringified.
+Before adding the properties, we check to make sure `store` exists. We have to check if `store` exists because the logger
+may be invoked outside the context of the local storage.
+
+The same can be applied to other tracing implementations or any infrastructure metadata that needs to be propagated without polluting method signatures.
+I hope you find this helpful. I'd love to learn how you're using `AsyncLocalStorage`.
+
+Go back [Home](/).

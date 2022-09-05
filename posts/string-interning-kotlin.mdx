@@ -1,0 +1,88 @@
+---
+title: String Interning
+description: I will cover the pitfalls of String Interning
+date: '2022-08-22'
+image: '/images/bridge.jpg'
+---
+
+STAR
+
+## Production Outage
+A seemingly simple feature was deployed and took down a highly critical component of the application. A simple rollback was issued, but the cause
+was not obvious.
+
+## Investigation
+After it was confirmed that the rollback was successful, I started to investigate the changes included the release.
+The feature was simple - it can be described as simple string comparisons between a source of truth and input from an
+external source.
+
+The change looked like something similar to the code below:
+```kotlin:service.kt
+fun isValid(input: String): Boolean {
+  return Config.source === input
+}
+```
+
+After reviewing the change, I checked to see if there were unit tests - which seemed unusual as we practiced TDD, but given
+the circumstance, it warranted additional review. As expected, the unit tests exercised the function thoroughly.
+I tried adding additional unit tests and walking the debugger, but could not find how this function can result in a
+complete outage. After a break, I returned to continue with the investigation and noticed something odd (you may have spotted
+the issue from the snippet of code). The comparison in the `isValid` function was using triple equal `===`. I had one of
+those aha moments, when I knew noticed the subtle change.
+
+## String Interning
+
+What is String Interning? String interning is a compiler optimization most modern compilers have. It is the process
+of creating a single copy of each distinct string value.
+
+```kotlin:service.kt
+val URL = "localhost"
+Class Service {
+
+  fun stringInterning() {
+    val copy = "localhost"
+  }
+
+}
+```
+
+Using the example above, there are two declarations assigned to the string value. The compiler will optimize the declarations
+by having both declarations point to the same instance of the string value `"localhost"` in memory.
+
+The compiled source could look like the following:
+```java:service.class
+String _common = "localhost"
+String URL = _common
+Class Service {
+
+  fun stringInterning() {
+    String copy = _common
+  }
+
+}
+```
+
+## Further Investigation
+
+```kotlin
+@ExtendWith(MockKExtension::class)
+class ServiceTest {
+    lateinit var service: Service
+
+    @MockK
+    lateinit var configService: ConfigService
+
+    @Test
+    fun `it should return true when input value matches source value`() {
+        val givenSource = Config(source = "valid")
+        every {
+            configService.get()
+        } returns givenSource
+
+        assertThat(service.isValid("valid")).isEqualTo(true)
+    }
+}
+```
+
+
+Go back [Home](/).
