@@ -5,14 +5,12 @@ date: '2022-08-22'
 image: '/images/bridge.jpg'
 ---
 
-STAR
-
 ## Production Outage
-A seemingly simple feature was deployed and took down a highly critical component of the application. A simple rollback was issued, but the cause
-was not obvious.
+What appeared to be simple feature took down a highly critical component of the application in production. This type of story
+is told by every developer 
 
 ## Investigation
-After it was confirmed that the rollback was successful, I started to investigate the changes included the release.
+After it was confirmed that the rollback was successful, I started to investigate the changes included in the release.
 The feature was simple - it can be described as simple string comparisons between a source of truth and input from an
 external source.
 
@@ -27,8 +25,8 @@ After reviewing the change, I checked to see if there were unit tests - which se
 the circumstance, it warranted additional review. As expected, the unit tests exercised the function thoroughly.
 I tried adding additional unit tests and walking the debugger, but could not find how this function can result in a
 complete outage. After a break, I returned to continue with the investigation and noticed something odd (you may have spotted
-the issue from the snippet of code). The comparison in the `isValid` function was using triple equal `===`. I had one of
-those aha moments, when I knew noticed the subtle change.
+the issue from the snippet of code). The comparison in the `isValid` function was using triple equals `===` and I had one of
+those aha moments.
 
 ## String Interning
 
@@ -36,31 +34,12 @@ What is String Interning? String interning is a compiler optimization most moder
 of creating a single copy of each distinct string value.
 
 ```kotlin:service.kt
-val URL = "localhost"
-Class Service {
-
-  fun stringInterning() {
-    val copy = "localhost"
-  }
-
-}
+val a = "home"
+val b = "home"
 ```
 
 Using the example above, there are two declarations assigned to the string value. The compiler will optimize the declarations
-by having both declarations point to the same instance of the string value `"localhost"` in memory.
-
-The compiled source could look like the following:
-```java:service.class
-String _common = "localhost"
-String URL = _common
-Class Service {
-
-  fun stringInterning() {
-    String copy = _common
-  }
-
-}
-```
+by having both declarations point to the same instance of the string value `"home"` in memory.
 
 ## Further Investigation
 
@@ -84,5 +63,26 @@ class ServiceTest {
 }
 ```
 
+The unit tests for this new function declared strings of the same value. As a result, the tests would pass because the reference operator (`===`) behaved like a value
+equality. However, in production, the values passed to the new function come from deserialized JSON and creates different objects - string objects in our case - even when
+values are the same which fail the reference check. Thus, the production outage.
+
+## How to avoid it
+
+Unfortuantely, due to the nature of the application, integration tests at an earlier stage was not possible yet, which would have identified this as a problem before reaching production.
+Having said that, there were other areas that could be improved.
+
+### Code Review
+
+I educated the team on this kind of issue and included this type of problem developers need to lookout for when reviewing code. 
+
+### Unit tests
+
+If applicable, declare strings using `String.format` or `String(charArrayOf())` to avoid string interning.
+
+This was an interesting problem to investigate and solve because it involved understanding how compilers work. In addition, it helped
+identify areas in the development process that can help improve the quality of the software. 
+
+I hope you found the information in this post interesting. Thanks so much for reading.
 
 Go back [Home](/).
